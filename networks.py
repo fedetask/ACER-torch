@@ -53,3 +53,38 @@ class LinearNetwork(nn.Module):
         if self.activation_last_layer is not None:
             x = self.activation_last_layer(x) * self.output_weight
         return x
+
+
+class DiscreteActorCriticSplit(torch.nn.Module):
+    """Wrapper class that keeps discrete actor and critic as separate networks.
+    """
+
+    def __init__(self, actor, critic):
+        """Instantiate the ActorCriticSplit from two networks.
+
+        Args:
+            actor (torch.nn.Module): Network that takes states as input and outputs the action
+                distribution. Must have a final Softmax layer.
+            critic (torch.nn.Module): Network that takes states as input and returns the
+                values for each action.
+        """
+        self.actor = actor
+        self.critic = critic
+
+    def forward(self, states):
+        """Compute action distribution and values for the given states.
+
+        Args:
+            states (torch.Tensor): A batch of N states.
+
+        Returns:
+            A tuple (action_probabilities, values) where both are tensors of shape (N, a_dim).
+        """
+        action_probabilities = self.actor(states)
+        values = self.critic(states)
+        return action_probabilities, values
+
+    def share_memory(self):
+        self.actor.share_memory()
+        self.critic.share_memory()
+
