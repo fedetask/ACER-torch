@@ -124,4 +124,7 @@ class EpisodicReplayBuffer:
             t.truncate(start_indices[i], end_indices[i]) for i, t in enumerate(trajectories)]
         return res_trajectories
 
-
+    def n_steps(self):
+        """Returns the sum of lengths of trajectories in the buffer.
+        """
+        return sum(t.get_length() for t in self.buffer)
