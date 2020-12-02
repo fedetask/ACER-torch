@@ -1,2 +1,2 @@
-# reactor-torch
-Pytorch implementation of the Reactor architecture - Distributional Reinforcement Learning
+# ACER-torch
+Pytorch implementation of the ACER architecture
