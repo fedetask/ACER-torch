@@ -68,6 +68,7 @@ class DiscreteActorCriticSplit(torch.nn.Module):
             critic (torch.nn.Module): Network that takes states as input and returns the
                 values for each action.
         """
+        super().__init__()
         self.actor = actor
         self.critic = critic
 
@@ -87,4 +88,3 @@ class DiscreteActorCriticSplit(torch.nn.Module):
     def share_memory(self):
         self.actor.share_memory()
         self.critic.share_memory()
-
