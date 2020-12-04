@@ -63,13 +63,15 @@ class EpisodeTrainingData:
 
 class Worker:
 
-    def __init__(self, env_name, n_steps, max_steps, shared_model, shared_avg_model,
-                 shared_optimizer, shared_counter, df, c, entropy_weight, tr_decay, buffer_len,
-                 start_train_at, grad_norm_clip, shared_model_lock, use_lock_update):
+    def __init__(self, worker_id, env_name, n_steps, max_steps, shared_model, shared_avg_model,
+                 shared_optimizer, shared_counter, df, c, entropy_weight, tau, buffer_len,
+                 start_train_at, grad_norm_clip, shared_model_lock, use_lock_update,
+                 summary_queue=None):
         """Create the worker, that collects trajectories from the environment, stores them in the
         replay buffer, performs local training and updates the shared model parameters.
 
         Args:
+            worker_id (int): Unique ID of the worker. Ids must be incremental starting from 0.
             env_name (str): Name of the environment to create.
             n_steps (int): Maximum length of trajectories collected at each iteration.
             max_steps (int): Maximum number of steps to perform across all threads.
@@ -79,14 +81,16 @@ class Worker:
             df (float): Discount factor.
             c (float): Maximum value for importance weights.
             entropy_weight (float): Weight of the entropy term in policy loss.
-            tr_decay (float): Decay parameter for average policy network update.
+            tau (float): Decay parameter for average policy network update.
             buffer_len (int): Maximum capacity (in trajectories) of the episodic replay buffer.
             start_train_at (int): Number of steps to take before starting to train.
             grad_norm_clip (float): Clipping gradient norm value. None for no clip.
             shared_model_lock (torch.multiprocessing.Lock): If not None, the lock is used to
                 safely pass gradients to the shared model.
             use_lock_update(bool): Whether to perform the shared model update inside the lock block.
+            summary_queue (torch.multiprocessing.Queue): Queue used to pass data to tensorboard.
         """
+        self.worker_id = worker_id
         self.n_steps = n_steps
         self.max_steps = max_steps
         self.shared_model = shared_model
@@ -96,25 +100,30 @@ class Worker:
         self.df = df
         self.c = c
         self.entropy_weight = entropy_weight
-        self.tr_decay = tr_decay
+        self.tau = tau
         self.start_train_at = start_train_at
         self.grad_norm_clip = grad_norm_clip
         self.shared_model_lock = shared_model_lock
         self.use_lock_update = use_lock_update
         if self.use_lock_update and self.shared_model_lock is None:
             raise ValueError('Lock is not passed but use_lock_update is True.')
+        self.summary_queue = summary_queue
         self.env = gym.make(env_name)
         self.replay_buffer = memory.EpisodicReplayBuffer(maxlen=buffer_len)
         self.model = copy.deepcopy(self.shared_model)
         self.cur_state = None
         self.done = True
-        self.rewards = []  # Each element is the total reward of an episode
         self.episode_rewards = []  # Each element is a reward of the current episode
+        self.rewards = []  # Each element is the total reward of an episode
+        self.episode_lengths = []  # Each element length of correspondent in self.rewards
 
     def run(self):
         while self.shared_counter.value() <= self.max_steps:
             self.model.load_state_dict(self.shared_model.state_dict())
             training_data = self.on_policy()  # Collect n_steps on policy
+            self._log_to_queue()  # Log on-policy rewards to queue
+            self.rewards = []
+            self.episode_lengths = []
             self._train(training_data)
 
     def on_policy(self):
@@ -127,14 +136,16 @@ class Worker:
                 state at which the last episode was cut.
         """
         t = 0
-        training_data = []
+        training_data = [] if self.done else [EpisodeTrainingData()]
         while t < self.n_steps:
             if self.done:  # Re-initialize objects for new episode
                 self.cur_state = utils.state_to_tensor(self.env.reset())
                 self.done = False
                 training_data.append(EpisodeTrainingData())
-                self.rewards.append(sum(self.episode_rewards))
-                self.episode_rewards = []
+                if len(self.episode_rewards) > 0:
+                    self.rewards.append(sum(self.episode_rewards))
+                    self.episode_lengths.append(len(self.episode_rewards))
+                    self.episode_rewards = []
 
             # Compute policy and q_values. Note that we do not detach elements used in training,
             # as this saves us computations in _train()
@@ -180,15 +191,13 @@ class Worker:
         q_rets = None  # retrace action values for each trajectory, shape (n_episodes, 1)
         for t in range(1, max_length):
             # Indices of trajectories that have more than t steps, used as mask
-            valid_indices = [i for i in range(n_episodes) if training_data[i].length() - t >= 0]
+            mask = [i for i in range(n_episodes) if training_data[i].length() - t >= 0]
             actions, policies, rewards, q_values, values, rhos, avg_p = self._extract(
-                training_data, valid_indices, t, off_policy, act_dim)
-
+                training_data, mask, t, off_policy, act_dim)
             if t == 1:  # Last time step of trajectories, initialize q_rets
                 q_rets = self._initial_q_ret(training_data)
-            q_rets = q_rets[valid_indices]
-            q_rets = rewards + self.df * q_rets
-            adv = q_rets - values
+            q_rets[mask] = rewards + self.df * q_rets[mask]
+            adv = q_rets[mask] - values
             log_prob = policies.gather(1, actions).log()
             step_policy_loss = -(rhos.gather(1, actions).clamp(max=self.c) * log_prob *
                                  adv.detach()).mean(0)  # Average over batch
@@ -205,11 +214,11 @@ class Worker:
 
             # Value update
             q = q_values.gather(1, actions)
-            value_loss += ((q_rets - q) ** 2 / 2).mean(0)  # Least squares loss
+            value_loss += ((q_rets[mask] - q) ** 2 / 2).mean(0)  # Least squares loss
 
             # Update the retrace target
             truncated_rho = rhos.gather(1, actions).clamp(max=self.c)
-            q_rets = truncated_rho * (q_rets - q.detach()) + values.detach()
+            q_rets[mask] = truncated_rho * (q_rets[mask] - q.detach()) + values.detach()
         # Transfer gradients to shared model and update
         self._update_networks(policy_loss + value_loss)
 
@@ -222,7 +231,7 @@ class Worker:
             else:
                 with torch.no_grad():
                     policy, q_values = self.model(training_data[i].last_state)
-                    q_rets[i, 0] (policy * q_values).sum(dim=1)
+                    q_rets[i, 0] = (policy * q_values).sum(dim=1)
         return q_rets
 
     def _extract(self, training_data, valid_indices, t, off_policy, act_dim):
@@ -238,7 +247,7 @@ class Worker:
                 tuple(training_data[i].old_policies[-t] for i in valid_indices), dim=0)
             rhos = policies.detach() / old_policies
         else:
-            rhos = torch.ones(1, act_dim)
+            rhos = torch.ones(actions.shape[0], act_dim)
         return actions, policies, rewards, q_values, values, rhos, avg_p
 
     def _update_networks(self, loss):
@@ -246,7 +255,7 @@ class Worker:
             # Update shared_average_model
             for param, avg_param in zip(self.shared_model.parameters(),
                                         self.shared_avg_model.parameters()):
-                avg_param.data.copy_(self.tr_decay * avg_param + (1 - self.tr_decay) * param)
+                avg_param.data.copy_(self.tau * avg_param + (1 - self.tau) * param)
         loss.backward()
         if self.grad_norm_clip is not None:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_norm_clip)
@@ -270,3 +279,7 @@ class Worker:
             if shared_param.grad is not None and overwrite_check:
                 return
             shared_param.grad = param.grad
+
+    def _log_to_queue(self):
+        if self.summary_queue is not None:
+            self.summary_queue.put(('rewards', self.rewards, self.episode_lengths))
