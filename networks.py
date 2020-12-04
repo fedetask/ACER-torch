@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 class LinearNetwork(nn.Module):
@@ -59,18 +60,20 @@ class DiscreteActorCriticSplit(torch.nn.Module):
     """Wrapper class that keeps discrete actor and critic as separate networks.
     """
 
-    def __init__(self, actor, critic):
+    def __init__(self, actor, critic, add_softmax=True):
         """Instantiate the ActorCriticSplit from two networks.
 
         Args:
             actor (torch.nn.Module): Network that takes states as input and outputs the action
-                distribution. Must have a final Softmax layer.
+                distribution.
             critic (torch.nn.Module): Network that takes states as input and returns the
                 values for each action.
+            add_softmax (bool): Whether to add a softmax layer to the actor network.
         """
         super().__init__()
         self.actor = actor
         self.critic = critic
+        self.add_softmax = add_softmax
 
     def forward(self, states):
         """Compute action distribution and values for the given states.
@@ -82,8 +85,15 @@ class DiscreteActorCriticSplit(torch.nn.Module):
             A tuple (action_probabilities, values) where both are tensors of shape (N, a_dim).
         """
         action_probabilities = self.actor(states)
+        if self.add_softmax:
+            action_probabilities = F.softmax(action_probabilities, dim=1)
         values = self.critic(states)
         return action_probabilities, values
+
+    def no_grads(self):
+        for act_p, crit_p in zip(self.actor.parameters(), self.critic.parameters()):
+            act_p.requires_grad = False
+            crit_p.requires_grad = False
 
     def share_memory(self):
         self.actor.share_memory()
