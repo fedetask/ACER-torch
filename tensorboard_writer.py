@@ -1,17 +1,26 @@
 from torch.utils import tensorboard
-from torch.multiprocessing import Queue
+
+
+WRITER_TIMEOUT = 2  # Used to avoid writer getting stuck on empty queue when workers terminate.
 
 
 class Writer:
     """Writer that runs in a separate process and consumes data to write produced by the workers.
     """
 
-    def __init__(self, queue):
+    def __init__(self, queue, processes=None):
+        """Create the writer.
+
+        Args:
+            queue (torch.multiprocessing.Queue): Shared queue from which to read the data.
+            processes (list): List of torch.multiprocessing.Process running the workers. If this
+                list is provided, the writer will stop once all processes are dead.
+        """
         self.queue = queue
+        self.processes = processes
         self.step = 0
-        self.on = True
         self.summary_writer = tensorboard.SummaryWriter()
-        self.test_queue = Queue()
+        self.c = 0
 
     def run(self):
         """Loop consuming items from the queue and writing them in tensorboard.
@@ -22,15 +31,19 @@ class Writer:
             steps (list): For each value, the corresponding duration in steps. I.e. if values
                 represents episode rewards, steps must contain the length of each episode. For
                 single-ste data (e.g. losses), leave as None or pass a list of ones.
+        The function stops when all known workers are dead. If no workers were passed at
+        initialization, runs forever.
         """
-        while self.on:
-            tag, values, steps = self.test_queue.get(block=True)
-            for i, v in enumerate(values):
-                if steps is not None:
-                    self.step += steps[i]
-                else:
-                    self.step += 1
-                self.summary_writer.add_scalar(tag, v, self.step)
+        while self.processes is None or self.workers_alive():
+            try:
+                tag, values, steps = self.queue.get(block=True, timeout=WRITER_TIMEOUT)
+                for i, v in enumerate(values):
+                    self.step += 1 if steps is None else steps[i]
+                    self.summary_writer.add_scalar(tag, v, self.step)
+            except:
+                pass  # Avoid writer stuck in queue when workers terminate.
 
-    def stop(self):
-        self.on = False
+    def workers_alive(self):
+        """Return True if at leas a worker process is alive.
+        """
+        return any(p.is_alive() for p in self.processes)
