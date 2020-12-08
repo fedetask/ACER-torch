@@ -14,7 +14,7 @@ class Trajectory:
     def __init__(self):
         self.states = []  # Note that states[1:] corresponds to the next states
         self.actions = []
-        self.p_actions = []
+        self.p_actions = []  # Policy for the state-action pair at the time the action was taken.
         self.rewards = []
 
     def episode_ended(self):
@@ -56,8 +56,9 @@ class EpisodicReplayBuffer:
     """Implementation of a replay buffer that stores Trajectory elements.
     """
 
-    def __init__(self, maxlen):
+    def __init__(self, maxlen, min_trajectory_len=2):
         self.maxlen = maxlen
+        self.min_trajectory_len = min_trajectory_len
         self.buffer = collections.deque(maxlen=maxlen)
         self._cur_trajectory = Trajectory()
 
@@ -76,8 +77,7 @@ class EpisodicReplayBuffer:
         self._cur_trajectory.p_actions.append(transition[2])
         self._cur_trajectory.rewards.append(transition[3])
         if transition[-1]:  # If done
-            self.buffer.append(self._cur_trajectory)
-            self._cur_trajectory = Trajectory()
+            self._store_and_reset()
 
     def cutoff(self, next_state):
         """Signal the replay buffer that the current cached trajectory has been cut by the
@@ -92,10 +92,9 @@ class EpisodicReplayBuffer:
                 was cut.
         """
         self._cur_trajectory.states.append(next_state)
-        self.buffer.append(self._cur_trajectory)
-        self._cur_trajectory = Trajectory()
+        self._store_and_reset()
 
-    def sample(self, batch_size, random_start=True, same_length=True):
+    def sample(self, batch_size, random_start=False, same_length=False):
         """Return a list of batch_size Trajectory objects sampled uniformly from the buffer and
         truncated to have the same length.
 
@@ -128,3 +127,13 @@ class EpisodicReplayBuffer:
         """Returns the sum of lengths of trajectories in the buffer.
         """
         return sum(t.get_length() for t in self.buffer)
+
+    def length(self):
+        """Return the number of trajectories contained in the replay buffer.
+        """
+        return len(self.buffer)
+
+    def _store_and_reset(self):
+        if len(self._cur_trajectory.actions) >= self.min_trajectory_len:
+            self.buffer.append(self._cur_trajectory)
+        self._cur_trajectory = Trajectory()
