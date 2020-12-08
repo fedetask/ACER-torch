@@ -2,6 +2,7 @@ from torch.utils import tensorboard
 
 
 WRITER_TIMEOUT = 2  # Used to avoid writer getting stuck on empty queue when workers terminate.
+WRITER_FLUSH_STEPS = 2
 
 
 class Writer:
@@ -19,7 +20,7 @@ class Writer:
         self.queue = queue
         self.processes = processes
         self.step = 0
-        self.summary_writer = tensorboard.SummaryWriter()
+        self.summary_writer = tensorboard.SummaryWriter(flush_secs=WRITER_FLUSH_STEPS)
         self.c = 0
 
     def run(self):
