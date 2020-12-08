@@ -9,20 +9,19 @@ https://github.com/dchetelat/acer
 import copy
 import math
 import random
+
+import gym
+
 import torch
-from torch import multiprocessing
 from typing import List
 
 import memory
-import gym
-
 import utils
-
-# Helper functions from https://github.com/Kaixhin/ACER/blob/master/train.py
 
 
 def _poisson(lmbd):
     # Knuth's algorithm for generating Poisson samples
+    # from https://github.com/Kaixhin/ACER/blob/master/train.py
     l, k, p = math.exp(-lmbd), 0, 1
     while p > l:
         k += 1
@@ -30,8 +29,21 @@ def _poisson(lmbd):
     return max(k - 1, 0)
 
 
-class EpisodeTrainingData:
+class TraceTrainingData:
     """Container class that keeps data used for training.
+
+    Attributes:
+        actions (list): List of tensors of shape (1, 1). Each tensor must be attached to graph.
+        policies (list): List of tensors of shape (1, K) containing policy predictions of the
+            episode states computed with the current model. Each tensor must be attached to graph.
+        q_values (list): List of tensors of shape (1, K). Each tensor must be attached to graph.
+        values (list): List of tensors of shape (1, 1). Each tensor must be attached to graph.
+        rewards (list): List of tensors of shape (1, 1).
+        avg_policies (list): List of tensors of shape (1, K). Each tensor must be attached to graph.
+        old_policies  (list): List of tensors of shape (1, K), or None if on-policy. Each tensor
+            must be attached to graph.
+        last_state (torch.Tensor): Tensor of shape (1, *state_dim) with the last state of the
+            trace, or None if episode ended.
     """
 
     def __init__(self):
@@ -41,32 +53,78 @@ class EpisodeTrainingData:
         self.values = []
         self.rewards = []
         self.avg_policies = []
-        self.old_policies = None
+        self.old_policies = []
         self.last_state = None
 
-    def append(self, action, policy, q_values, values, reward, average_policy, last_state=None,
+    def append(self, action, policy, q_values, value, reward, average_policy, last_state=None,
                old_policies=None):
         # NOTE: policy is always the policy for the current model, old_policy the one in the
         # replay buffer.
         self.actions.append(action)
         self.policies.append(policy)
         self.q_values.append(q_values)
-        self.values.append(values)
+        self.values.append(value)
         self.rewards.append(reward)
         self.avg_policies.append(average_policy)
         self.last_state = last_state
         self.old_policies = old_policies
 
+    def init_from(self, actions, policies, q_values, values, rewards, avg_policies,
+                  old_policies=None, last_state=None):
+        self.actions = actions
+        self.policies = policies
+        self.q_values = q_values
+        self.values = values
+        self.rewards = rewards
+        self.avg_policies = avg_policies
+        self.old_policies = old_policies if old_policies is not None else []
+        self.last_state = last_state
+
     def length(self):
         return len(self.actions)
 
 
+def extract(training_data, valid_indices, t, off_policy, act_dim):
+    """Extract from the training data all the elements for the given timestep as a tuple of
+    stacked tensors.
+
+    Args:
+        training_data (list): List of TraceTrainingData objects from which to extract.
+        valid_indices (list): List of indices corresponding to train_data object for which t is
+            a valid timestep.
+        t (int): Time-step for which the data has to be extracted.
+        off_policy (bool): Whether the training_data objects come from old policies.
+        act_dim (int): Dimension of actions.
+
+    Returns:
+        A tuple (actions, policies, rewards, q_values, values, rhos, avg_p) where each element is
+        a tensor of stacked elements from training_data[valid_indices] at time-step t.
+        rhos contain the importance samples computed, or ones if not off_policy.
+    """
+    # Extract elements at position -t from training data
+    actions = torch.cat(tuple(training_data[i].actions[-t] for i in valid_indices), dim=0)
+    policies = torch.cat(tuple(training_data[i].policies[-t] for i in valid_indices), dim=0)
+    q_values = torch.cat(tuple(training_data[i].q_values[-t] for i in valid_indices), dim=0)
+    rewards = torch.cat(tuple(training_data[i].rewards[-t] for i in valid_indices), dim=0)
+    values = torch.cat(tuple(training_data[i].values[-t] for i in valid_indices), dim=0)
+    avg_p = torch.cat(tuple(training_data[i].avg_policies[-t] for i in valid_indices), dim=0)
+    if off_policy:
+        old_policies = torch.cat(
+            tuple(training_data[i].old_policies[-t] for i in valid_indices), dim=0)
+        rhos = policies.detach() / old_policies
+    else:
+        rhos = torch.ones(actions.shape[0], act_dim)
+    return actions, policies, rewards, q_values, values, rhos, avg_p
+
+
 class Worker:
+    """Implementation of a worker.
+    """
 
     def __init__(self, worker_id, env_name, n_steps, max_steps, shared_model, shared_avg_model,
                  shared_optimizer, shared_counter, df, c, entropy_weight, tau, buffer_len,
-                 start_train_at, grad_norm_clip, shared_model_lock, use_lock_update,
-                 summary_queue=None):
+                 replay_ratio, batch_size, start_train_at, grad_norm_clip, shared_model_lock,
+                 use_lock_update, summary_queue=None):
         """Create the worker, that collects trajectories from the environment, stores them in the
         replay buffer, performs local training and updates the shared model parameters.
 
@@ -82,7 +140,9 @@ class Worker:
             c (float): Maximum value for importance weights.
             entropy_weight (float): Weight of the entropy term in policy loss.
             tau (float): Decay parameter for average policy network update.
+            replay_ratio (int): Expected value of off-policy trainings for each on-policy training.
             buffer_len (int): Maximum capacity (in trajectories) of the episodic replay buffer.
+            batch_size (int): Batch size for the off-policy step.
             start_train_at (int): Number of steps to take before starting to train.
             grad_norm_clip (float): Clipping gradient norm value. None for no clip.
             shared_model_lock (torch.multiprocessing.Lock): If not None, the lock is used to
@@ -102,6 +162,8 @@ class Worker:
         self.entropy_weight = entropy_weight
         self.tau = tau
         self.start_train_at = start_train_at
+        self.replay_ratio = replay_ratio
+        self.batch_size = batch_size
         self.grad_norm_clip = grad_norm_clip
         self.shared_model_lock = shared_model_lock
         self.use_lock_update = use_lock_update
@@ -124,24 +186,27 @@ class Worker:
             self._log_to_queue()  # Log on-policy rewards to queue
             self.rewards = []
             self.episode_lengths = []
-            self._train(training_data)
+            self._train(training_data, off_policy=False)
+            if self.replay_buffer.length() > self.start_train_at \
+               and self.replay_buffer.length() > self.batch_size:
+                self.off_policy()
 
     def on_policy(self):
         """Perform n_steps on-policy, and return the data necessary for on-policy update,
         and updates shared_counter.
 
         Returns:
-            training_data (list): A list of EpisodeTrainingData objects, one for each episode run.
+            training_data (list): A list of TraceTrainingData objects, one for each episode run.
                 Only the last object may contain a last_state attribute corresponding to the
                 state at which the last episode was cut.
         """
         t = 0
-        training_data = [] if self.done else [EpisodeTrainingData()]
+        training_data = [] if self.done else [TraceTrainingData()]
         while t < self.n_steps:
             if self.done:  # Re-initialize objects for new episode
                 self.cur_state = utils.state_to_tensor(self.env.reset())
                 self.done = False
-                training_data.append(EpisodeTrainingData())
+                training_data.append(TraceTrainingData())
                 if len(self.episode_rewards) > 0:
                     self.rewards.append(sum(self.episode_rewards))
                     self.episode_lengths.append(len(self.episode_rewards))
@@ -150,8 +215,9 @@ class Worker:
             # Compute policy and q_values. Note that we do not detach elements used in training,
             # as this saves us computations in _train()
             policy, q_values = self.model(self.cur_state)
-            values = (policy * q_values).sum(dim=1, keepdim=True)
-            avg_policy, _ = self.shared_avg_model(self.cur_state)
+            value = (policy * q_values).sum(dim=1, keepdim=True)
+            with torch.no_grad():
+                avg_policy, _ = self.shared_avg_model(self.cur_state)
             action = torch.multinomial(policy, num_samples=1)[0, 0]
 
             next_state, reward, done, _ = self.env.step(action.item())
@@ -159,11 +225,12 @@ class Worker:
 
             # Save transition in replay buffer
             self.replay_buffer.append_transition(
-                (self.cur_state, action, policy.detach(), reward, done))
+                (self.cur_state, torch.LongTensor([[action.item()]]), policy.detach(),
+                 torch.LongTensor([[reward]]), done))
             # Save data for training (all tensors have first dimension 1)
             training_data[-1].append(
                 action=torch.LongTensor([[action]]), policy=policy, q_values=q_values,
-                values=values, reward=torch.Tensor([[reward]]), average_policy=avg_policy)
+                value=value, reward=torch.Tensor([[reward]]), average_policy=avg_policy)
 
             # Update loop data
             t += 1
@@ -177,7 +244,15 @@ class Worker:
         self.shared_counter.increment(t)
         return training_data
 
-    def _train(self, training_data: List[EpisodeTrainingData], off_policy=None):
+    def off_policy(self):
+        """Perform n off-policy training steps, where n ~ Poisson(self.lambda).
+        """
+        for i in range(_poisson(self.replay_ratio)):
+            batch = self.replay_buffer.sample(batch_size=self.batch_size)
+            training_data = [self._get_training_data(trajectory) for trajectory in batch]
+            self._train(training_data, off_policy=True)
+
+    def _train(self, training_data: List[TraceTrainingData], off_policy):
         # Perform training step. Code mainly inspired from
         # https://github.com/Kaixhin/ACER/blob/c711b911baf34b7acf1dbaf0cfeccc6d78277134/train.py
         # NOTE: training_data contains data from trajectories that do not have the same length
@@ -192,7 +267,7 @@ class Worker:
         for t in range(1, max_length):
             # Indices of trajectories that have more than t steps, used as mask
             mask = [i for i in range(n_episodes) if training_data[i].length() - t >= 0]
-            actions, policies, rewards, q_values, values, rhos, avg_p = self._extract(
+            actions, policies, rewards, q_values, values, rhos, avg_p = extract(
                 training_data, mask, t, off_policy, act_dim)
             if t == 1:  # Last time step of trajectories, initialize q_rets
                 q_rets = self._initial_q_ret(training_data)
@@ -234,21 +309,23 @@ class Worker:
                     q_rets[i, 0] = (policy * q_values).sum(dim=1)
         return q_rets
 
-    def _extract(self, training_data, valid_indices, t, off_policy, act_dim):
-        # Extract elements at position -t from training data
-        actions = torch.cat(tuple(training_data[i].actions[-t] for i in valid_indices), dim=0)
-        policies = torch.cat(tuple(training_data[i].policies[-t] for i in valid_indices), dim=0)
-        q_values = torch.cat(tuple(training_data[i].q_values[-t] for i in valid_indices), dim=0)
-        rewards = torch.cat(tuple(training_data[i].rewards[-t] for i in valid_indices), dim=0)
-        values = torch.cat(tuple(training_data[i].values[-t] for i in valid_indices), dim=0)
-        avg_p = torch.cat(tuple(training_data[i].avg_policies[-t] for i in valid_indices), dim=0)
-        if off_policy:
-            old_policies = torch.cat(
-                tuple(training_data[i].old_policies[-t] for i in valid_indices), dim=0)
-            rhos = policies.detach() / old_policies
-        else:
-            rhos = torch.ones(actions.shape[0], act_dim)
-        return actions, policies, rewards, q_values, values, rhos, avg_p
+    def _get_training_data(self, trajectory: memory.Trajectory):
+        # Create a TraceTrainingData object from the given trajectory.
+        train_data = TraceTrainingData()
+        states = torch.cat(tuple(state for state in trajectory.states))
+        policies, q_values = self.model(states)
+        values = (policies * q_values).sum(dim=1, keepdim=True)
+        with torch.no_grad():
+            avg_policies, _ = self.shared_avg_model(states)
+        policies = [policy.unsqueeze(0) for policy in policies]
+        q_values = [q_val.unsqueeze(0) for q_val in q_values]
+        values = [value.unsqueeze(0) for value in values]
+        avg_policies = [avg_policy.unsqueeze(0) for avg_policy in avg_policies]
+        last_state = trajectory.states[-1]
+        train_data.init_from(actions=trajectory.actions, policies=policies, q_values=q_values,
+                             values=values, rewards=trajectory.rewards, avg_policies=avg_policies,
+                             old_policies=trajectory.p_actions, last_state=last_state)
+        return train_data
 
     def _update_networks(self, loss):
         def update_avg_policy():
@@ -282,4 +359,4 @@ class Worker:
 
     def _log_to_queue(self):
         if self.summary_queue is not None:
-            self.summary_queue.put(('rewards', self.rewards, self.episode_lengths))
+            self.summary_queue.put(('rewards', self.rewards, self.episode_lengths), block=False)
