@@ -1,4 +1,3 @@
-import time
 import queue
 
 from torch.utils import tensorboard
@@ -50,7 +49,7 @@ class Writer:
                         if tag not in self.step:
                             self.step[tag] = -1
                         self.step[tag] += 1 if steps is None else steps[i]
-                        self.summary_writer.add_scalar(tag, v, self.step[tag], time.time_ns())
+                        self.summary_writer.add_scalar(tag, v, self.step[tag])
             except queue.Empty:
                 pass  # Avoid writer stuck in queue when workers terminate.
 
