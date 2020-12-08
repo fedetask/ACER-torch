@@ -22,5 +22,6 @@ class Counter:
 def cuda_if(tensor):
     return tensor.cuda() if torch.cuda.is_available() else tensor
 
+
 def state_to_tensor(state):
     return torch.from_numpy(state).float().unsqueeze(0)
