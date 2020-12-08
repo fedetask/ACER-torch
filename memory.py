@@ -25,7 +25,7 @@ class Trajectory:
         If False, states has an additional state corresponding to the state at which the
         trajectory was cut.
         """
-        return self.states[-1] is None
+        return len(self.states) == len(self.actions)
 
     def get_length(self):
         """Returns the length of the trajectory, without counting the possible additional final

@@ -312,7 +312,12 @@ class Worker:
     def _get_training_data(self, trajectory: memory.Trajectory):
         # Create a TraceTrainingData object from the given trajectory.
         train_data = TraceTrainingData()
-        states = torch.cat(tuple(state for state in trajectory.states))
+        if trajectory.episode_ended():
+            states = torch.cat(tuple(state for state in trajectory.states))
+            last_state = None
+        else:  # Last state is passed separately
+            states = torch.cat(tuple(state for state in trajectory.states[:-1]))
+            last_state = trajectory.states[-1]
         policies, q_values = self.model(states)
         values = (policies * q_values).sum(dim=1, keepdim=True)
         with torch.no_grad():
@@ -321,7 +326,6 @@ class Worker:
         q_values = [q_val.unsqueeze(0) for q_val in q_values]
         values = [value.unsqueeze(0) for value in values]
         avg_policies = [avg_policy.unsqueeze(0) for avg_policy in avg_policies]
-        last_state = trajectory.states[-1]
         train_data.init_from(actions=trajectory.actions, policies=policies, q_values=q_values,
                              values=values, rewards=trajectory.rewards, avg_policies=avg_policies,
                              old_policies=trajectory.p_actions, last_state=last_state)
