@@ -123,8 +123,8 @@ class Worker:
 
     def __init__(self, worker_id, env_name, n_steps, max_steps, shared_model, shared_avg_model,
                  shared_optimizer, shared_counter, df, c, entropy_weight, tau, buffer_len,
-                 replay_ratio, batch_size, start_train_at, grad_norm_clip, shared_model_lock,
-                 use_lock_update, summary_queue=None):
+                 replay_ratio, batch_size, start_train_at, grad_norm_clip,
+                 trust_region, shared_model_lock, use_lock_update, summary_queue=None):
         """Create the worker, that collects trajectories from the environment, stores them in the
         replay buffer, performs local training and updates the shared model parameters.
 
@@ -145,6 +145,7 @@ class Worker:
             batch_size (int): Batch size for the off-policy step.
             start_train_at (int): Number of steps to take before starting to train.
             grad_norm_clip (float): Clipping gradient norm value. None for no clip.
+            trust_region (float): KL Divergence threshold between updates.
             shared_model_lock (torch.multiprocessing.Lock): If not None, the lock is used to
                 safely pass gradients to the shared model.
             use_lock_update(bool): Whether to perform the shared model update inside the lock block.
@@ -165,6 +166,7 @@ class Worker:
         self.replay_ratio = replay_ratio
         self.batch_size = batch_size
         self.grad_norm_clip = grad_norm_clip
+        self.trust_region = trust_region
         self.shared_model_lock = shared_model_lock
         self.use_lock_update = use_lock_update
         if self.use_lock_update and self.shared_model_lock is None:
@@ -183,13 +185,16 @@ class Worker:
         while self.shared_counter.value() <= self.max_steps:
             self.model.load_state_dict(self.shared_model.state_dict())
             training_data = self.on_policy()  # Collect n_steps on policy
-            self._log_to_queue()  # Log on-policy rewards to queue
+            kl_div, h_loss, h_mean, p_loss, v_loss = self._train(training_data, off_policy=False)
+            if self.replay_buffer.length() > self.start_train_at \
+                    and self.replay_buffer.length() > self.batch_size:
+                self.off_policy()
+            self._log_to_queue(rewards=self.rewards, episode_lengths=self.episode_lengths,
+                               p_loss=p_loss, v_loss=v_loss, on_kl_div=kl_div,
+                               entropy_loss=h_loss, entropy_mean=h_mean, off_kl_div=None)
+            # Reset rewards and episode_lengths but not episode_rewards
             self.rewards = []
             self.episode_lengths = []
-            self._train(training_data, off_policy=False)
-            if self.replay_buffer.length() > self.start_train_at \
-               and self.replay_buffer.length() > self.batch_size:
-                self.off_policy()
 
     def on_policy(self):
         """Perform n_steps on-policy, and return the data necessary for on-policy update,
@@ -257,10 +262,11 @@ class Worker:
         # https://github.com/Kaixhin/ACER/blob/c711b911baf34b7acf1dbaf0cfeccc6d78277134/train.py
         # NOTE: training_data contains data from trajectories that do not have the same length
         act_dim = training_data[0].policies[0].size(1)
-        policy_loss, value_loss = 0., 0.
+        total_loss = torch.tensor([0.])
 
         # Iterate all training data from last step backwards, so that they are aligned w.r.t. the
         # backward retrace recursive target computation even when they have different lengths.
+        kl_divs, entropy_losses, entropy_values, policy_losses, value_losses = [], [], [], [], []
         n_episodes = len(training_data)
         max_length = max(len(data.rewards) for data in training_data)
         q_rets = None  # retrace action values for each trajectory, shape (n_episodes, 1)
@@ -282,20 +288,60 @@ class Worker:
                 step_policy_loss -= (bias_weight * policies.log() *
                                      (q_values.detach() - values.expand_as(q_values).detach())
                                      ).sum(1).mean(0)  # Average over batch
-            # TODO: Trust region
-            policy_loss += step_policy_loss
+            if self.trust_region is None:
+                policy_loss = step_policy_loss
+            else:
+                policy_loss = self._add_kl_constraint(step_policy_loss, policies, avg_p)
             # Sum over probabilities (H = E[log p]), average over batch
-            policy_loss += self.entropy_weight * (policies.log() * policies).sum(1).mean(0)
+            entropy_loss = - self.entropy_weight * (policies.log() * policies).sum(1).mean(0)
 
             # Value update
             q = q_values.gather(1, actions)
-            value_loss += ((q_rets[mask] - q) ** 2 / 2).mean(0)  # Least squares loss
+            value_loss = ((q_rets[mask] - q) ** 2 / 2).mean(0)  # Least squares loss
 
             # Update the retrace target
             truncated_rho = rhos.gather(1, actions).clamp(max=self.c)
             q_rets[mask] = truncated_rho * (q_rets[mask] - q.detach()) + values.detach()
+
+            # Update total loss
+            total_loss += policy_loss + value_loss + entropy_loss
+
+            # Compute statistics
+            mean_kl = (avg_p * (avg_p.log() - policies.log())).sum(1).mean()
+            entropy = -(policies * policies.log()).sum(1).mean()
+            kl_divs.append(mean_kl.item())
+            entropy_losses.append(entropy_loss.item())
+            policy_losses.append(policy_loss.item())
+            value_losses.append(value_loss.item())
+            entropy_values.append(entropy.item())
+
         # Transfer gradients to shared model and update
-        self._update_networks(policy_loss + value_loss)
+        self._update_networks(total_loss)
+        return kl_divs, entropy_losses, entropy_values, policy_losses, value_losses
+
+    def _add_kl_constraint(self, loss, policy, avg_policy):
+        """Modify the given loss to enforce the KL constraint.
+
+        Args:
+            loss (torch.Tensor): Tensor containing the single step loss.
+            policy (torch.Tensor): Tensor of shape (batch_size, K) containing the probabilities
+                (from the local model) for each action. Must be connected to the loss graph.
+            avg_policy (torch.Tensor): Tensor of shape (batch_size, K) containing probabilities
+                (from the shared avg mode) for each action. Must be connected to the loss graph.
+
+        Returns:
+            Tensor containing the new step loss.
+        """
+        g = torch.autograd.grad(loss, policy)[0]  # Grad of loss w.r.t. policy
+        kl = (avg_policy * (avg_policy.log() - policy.log())).sum()
+        k = torch.autograd.grad(-kl, policy)[0]  # Grad of KL between policy and avg_policy
+        k_dot_g = (k * g).sum(1)
+        k_dot_k = (k * k).sum(1)
+        k_factor = ((k_dot_g - self.trust_region) / k_dot_k).unsqueeze(1)
+        k_factor = torch.where(k_factor > 0., k_factor, torch.zeros_like(k_factor))
+        z = (g - k_factor * k).detach()
+        constrained_loss = (policy * z).sum()
+        return constrained_loss
 
     def _initial_q_ret(self, training_data):
         # Compute the initial retrace action-value.
@@ -332,6 +378,9 @@ class Worker:
         return train_data
 
     def _update_networks(self, loss):
+        # Call backward() on the loss, clip the gradient and update
+        # the network with or without locks.
+
         def update_avg_policy():
             # Update shared_average_model
             for param, avg_param in zip(self.shared_model.parameters(),
@@ -361,6 +410,17 @@ class Worker:
                 return
             shared_param.grad = param.grad
 
-    def _log_to_queue(self):
+    def _log_to_queue(self, rewards, episode_lengths, p_loss, v_loss, on_kl_div, entropy_loss,
+                      entropy_mean, off_kl_div):
         if self.summary_queue is not None:
-            self.summary_queue.put(('rewards', self.rewards, self.episode_lengths), block=False)
+            data_dict = {
+                'rewards': (rewards, episode_lengths),
+                'on-policy/losses/entropy-loss': (entropy_loss, None),
+                'on-policy/losses/policy-loss': (p_loss, None),
+                'on-policy/losses/value-loss': (v_loss, None),
+                'on-policy/stats/mean-kl': (on_kl_div, None),
+                'on-policy/stats/mean-entropy': (entropy_mean, None)
+            }
+            if off_kl_div is not None:
+                data_dict['off-policy-kl'] = (off_kl_div, None)
+            self.summary_queue.put(data_dict, block=False)
