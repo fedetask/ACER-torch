@@ -92,3 +92,10 @@ optional arguments:
 - [ ] Continuous actions
 - [ ] Full trust region option
 - [ ] Load and save model
+
+# References
+[1] 2017, Wang et al. 
+[Sample Efficient Actor Critic with Experience Replay](https://arxiv.org/pdf/1611.01224.pdf)
+
+[2] 2016, Munos et al.
+[Safe and efficient off-policy reinforcement learning](https://arxiv.org/pdf/1606.02647.pdf)
