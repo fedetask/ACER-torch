@@ -45,7 +45,7 @@ if __name__ == '__main__':
     parser.add_argument('--c', action='store', type=float, default=1,
                         help='Retrace importance weight truncation. Defaults to 1.')
     parser.add_argument('--trust-region', action='store_true', default=False,
-                        help='Use trust region constraint in policy updates. Defaults to True.')
+                        help='Use trust region constraint in policy updates. Defaults to False.')
     parser.add_argument('--trust-region-threshold', action='store', type=float, default=1,
                         help='Trust region threshold value (delta in Eq. 12 of ACER paper). '
                              'Defaults to 1.')
