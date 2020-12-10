@@ -292,8 +292,9 @@ class Worker:
                 policy_loss = step_policy_loss
             else:
                 policy_loss = self._add_kl_constraint(step_policy_loss, policies, avg_p)
-            # Sum over probabilities (H = E[log p]), average over batch
-            entropy_loss = - self.entropy_weight * (policies.log() * policies).sum(1).mean(0)
+
+            # Loss proportional to negative entropy
+            entropy_loss = self.entropy_weight * (policies.log() * policies).sum(1).mean(0)
 
             # Value update
             q = q_values.gather(1, actions)
