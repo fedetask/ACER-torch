@@ -1,4 +1,7 @@
 # ACER-torch
+
+[![DOI](https://zenodo.org/badge/317584821.svg)](https://zenodo.org/badge/latestdoi/317584821)
+
 ACER[1] is an Actor-Critic Off-Policy Reinforcement Learning algorithm.
 Its main features are:
 - Multi-step Experience Replay
@@ -99,3 +102,15 @@ optional arguments:
 
 [2] 2016, Munos et al.
 [Safe and efficient off-policy reinforcement learning](https://arxiv.org/pdf/1606.02647.pdf)
+
+# Cite this code
+```
+@software{fedetask2021,
+  author = {Federico Taschin},
+  title = {ACER-torch implementation},
+  url = {https://github.com/fedetask/ACER-torch/},
+  version = {1.0},
+  year = {2021},
+  doi = {https://zenodo.org/badge/latestdoi/317584821}
+}
+```
